@@ -1,0 +1,73 @@
+# tsm — how this host joins the tailnet.
+#
+# Copy to config.yml and edit. Every key is optional; an unset key is simply not passed
+# to tailscale. `tailscale up` does not persist flags between runs, so this file is the
+# single source of truth and tsm always passes the full set it knows about.
+#
+# In the ppm layout the real config.yml is normally shipped by your `user` repo
+# (user/packages/tailscale/home/.config/tailscale/config.yml) so it is versioned and
+# reaches every host, while this example stays with the generic utils package.
+#
+#   tsm show     render the flags this file produces, secret masked
+#   tsm join     join the tailnet
+#   tsm set      reconcile an already-joined node with this file
+
+# --hostname. Drives MagicDNS: `web1` becomes web1.<tailnet>.ts.net, resolvable from
+# every other node. Worth setting — a fresh VM or Pi image often reports something
+# useless like `localhost.localdomain`, and two of those collide into `web1-1`.
+# Unset = whatever the OS reports.
+hostname: web1
+
+# --advertise-tags. This is the big fork.
+#
+# Tagged: the node belongs to the tailnet, not to a person. Key expiry is disabled, so it
+# never silently drops off — which is what you want for a server you touch twice a year.
+# ACLs address it by tag instead of by owner.
+#
+# Untagged (empty list): the node belongs to whoever authenticated it, and its key expires
+# every 180 days, needing a browser to renew. Fine for a laptop, bad for a headless host.
+#
+# An OAuth client secret can ONLY mint a tagged node, so leaving this empty means the
+# credential must be a plain auth key. Every tag here must already exist in the tailnet
+# policy file's tagOwners — see `tsm prereqs`.
+tags:
+  - tag:server
+
+# --ssh. Runs Tailscale's own SSH server, authenticating against tailnet identity instead
+# of authorized_keys: no key distribution, central and instant revocation, sessions logged
+# in the admin console. Needs a matching ACL rule granting access to this node's tag, or
+# you have turned on a door with no one holding the key.
+ssh: true
+
+# --accept-dns. Use the tailnet's MagicDNS resolver.
+accept_dns: true
+
+# --operator. Lets this unix user drive tailscaled without sudo. Unset = root only.
+# operator: ansible
+
+# ---------------------------------------------------------------------------
+# Routing. Both of the keys below can cut you off from a remote host, so tsm
+# refuses to apply either over an SSH session unless you pass --yes. See the
+# "Not losing your SSH session" section of the package README.
+# ---------------------------------------------------------------------------
+
+# --advertise-routes. Makes this node a gateway to a LAN, so tailnet members can reach
+# machines that are not themselves on the tailnet. Safe to advertise: advertising is a
+# declaration and does not change this node's own routing. Routes stay pending until
+# approved in the admin console, or automatically via autoApprovers in the policy file.
+# advertise_routes:
+#   - 172.31.16.0/24
+
+# --advertise-exit-node. Offers this node as a full VPN egress. Also safe: offering is
+# not using.
+advertise_exit_node: false
+
+# --accept-routes. DANGEROUS on a remote host. If any subnet router in the tailnet
+# advertises a range covering the address you are connected over, that traffic is
+# redirected into the tailnet and your session dies. Tailscale does not fall back to a
+# less specific route.
+accept_routes: false
+
+# --exit-node. DANGEROUS on a remote host: routes ALL of this node's traffic through
+# another node, including the path your SSH session is using. Empty = no exit node.
+exit_node: ""

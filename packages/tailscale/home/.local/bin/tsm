@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# tsm — tailscale manager: join a host to a tailnet from a declarative config.
+#
+# The config (~/.config/tailscale/config.yml) says what this host should be on the
+# tailnet; tsm translates it to tailscale flags. `tailscale up` does not persist flags
+# between runs, so the file is the single source of truth and tsm always passes the full
+# set — otherwise an omitted flag silently reverts to a default.
+#
+# Why not tailscaled's own config file: it has no AdvertiseTags field, which an OAuth
+# join requires; it is alpha0; it configures the daemon rather than the CLI, so it needs
+# the vendor-owned systemd unit edited; and its authKey would put the secret on disk.
+#
+# Secrets come from the environment. A fnox.toml beside the config is used automatically.
+
+set -euo pipefail
+
+ARGV=("$@")
+
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+TSM_CONFIG_HOME="${TSM_CONFIG_HOME:-$XDG_CONFIG_HOME/tailscale}"
+TSM_CONFIG="${TSM_CONFIG:-$TSM_CONFIG_HOME/config.yml}"
+TSM_CACHE="${TSM_CACHE:-$XDG_CACHE_HOME/tsm}"
+
+DRY_RUN=false
+ASSUME_YES=false
+
+usage() {
+  cat <<'EOF'
+Usage: tsm <command> [options]
+
+Commands:
+  join        Join this host to the tailnet using ~/.config/tailscale/config.yml
+  set         Reconcile an already-joined node with the config (no re-auth)
+  status      Tailnet status for this node
+  show        Render the flags the config produces, secret masked
+  prereqs     The manual tailnet setup, plus what can be checked from here
+  info        Paths, binary, daemon state, credential and key-handoff mode
+  help        Show this help
+
+Options:
+  -n, --dry-run   Print what would run; touch nothing
+  -y, --yes       Skip confirmations, including the prerequisite acknowledgement
+
+The first `tsm join` on a host asks you to confirm the tailnet prerequisites (see
+`tsm prereqs`) and caches the answer in ~/.cache/tsm/. Re-pointing the host at a
+different tailnet asks again.
+
+Config keys: hostname, tags, ssh, accept_dns, accept_routes, advertise_routes,
+advertise_exit_node, exit_node, operator. See config.example.yml for what each does.
+
+Environment:
+  TSM_CONFIG          Config file (default ~/.config/tailscale/config.yml)
+  TSM_CACHE           Cache dir  (default ~/.cache/tsm)
+  TAILSCALE_BIN       Path to the tailscale CLI
+  TSM_AUTHKEY_MODE    file|argv — how the key reaches tailscale (default: probed)
+EOF
+}
+
+die() {
+  # shellcheck disable=SC2059
+  printf "tsm: $1\n" "${@:2}" >&2
+  exit 1
+}
+
+warn() {
+  # shellcheck disable=SC2059
+  printf "tsm: $1\n" "${@:2}" >&2
+}
+
+# Follow a symlink chain without realpath(1), which macOS lacks by default.
+resolve_link() {
+  local self="$1" dir link
+  dir="$(cd "$(dirname "$self")" && pwd)"
+  while [[ -L "$self" ]]; do
+    link="$(readlink "$self")"
+    [[ "$link" == /* ]] || link="$dir/$link"
+    self="$link"
+    dir="$(cd "$(dirname "$self")" && pwd)"
+  done
+  printf '%s\n' "$self"
+}
+
+# Libraries: the shared ones, then the platform one picked by uname. The stowed location
+# is preferred; next to a checkout is the fallback, so tsm runs from the package
+# directory during development.
+load_libs() {
+  local os here candidate dir="" lib
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  here="$(cd "$(dirname "$(resolve_link "$0")")" && pwd)"
+  for candidate in "${TSM_LIB:-}" \
+                   "$HOME/.local/lib/tsm" \
+                   "$here/../lib/tsm" \
+                   "$here/../../lib/tsm"; do
+    [[ -n "$candidate" && -f "$candidate/common.sh" ]] || continue
+    dir="$candidate"
+    break
+  done
+  [[ -n "$dir" ]] || die "libraries not found (looked for common.sh in ~/.local/lib/tsm)\n  run: ppm install -f utils/tailscale"
+
+  for lib in common prereqs; do
+    # shellcheck source=/dev/null
+    source "$dir/$lib.sh"
+  done
+  [[ -f "$dir/$os.sh" ]] || die "no platform library for '%s' (expected %s/%s.sh)\n  this release supports macOS and Linux" "$os" "$dir" "$os"
+  # shellcheck source=/dev/null
+  source "$dir/$os.sh"
+}
+
+# ---------------------------------------------------------------------------
+# fnox: secrets for every later step
+# ---------------------------------------------------------------------------
+
+# Same predicate and file names as utils/rpi-imager and pdt/pcm.
+uses_fnox() {
+  local d n
+  for d in "$TSM_CONFIG_HOME" "$PWD"; do
+    for n in fnox.toml .fnox.toml fnox.local.toml; do
+      [[ -f "$d/$n" ]] && { TSM_FNOX_DIR="$d"; return 0; }
+    done
+  done
+  return 1
+}
+
+# Re-exec under `fnox exec` from the config directory, once, so TS_AUTHKEY is present.
+# Wholesale rather than per-step because the credential is needed by join, and by the
+# checks in prereqs, and because relative paths in the config should resolve there.
+enter_fnox() {
+  [[ -z "${TSM_IN_FNOX:-}" ]] || return 0
+  export TSM_IN_FNOX=1
+  if command -v fnox >/dev/null 2>&1 && uses_fnox; then
+    export TSM_FNOX_DIR
+    cd "$TSM_FNOX_DIR"
+    exec fnox exec -- "$(resolve_link "$0")" ${ARGV[@]+"${ARGV[@]}"}
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+# Everything except the raw key. `tsm show` is meant to be safe to paste into a bug report.
+cmd_show() {
+  load_config
+  check_unknown_keys
+  build_join_flags
+  printf 'config:  %s\n' "$TSM_CONFIG"
+  printf 'join:    tailscale up --auth-key=<TS_AUTHKEY> %s\n' "${TS_FLAGS[*]:-}"
+  build_flags
+  printf 'set:     tailscale set %s\n' "${TS_FLAGS[*]:-}"
+  if [[ -n "$CFG_TAGS" ]]; then
+    printf '\nThis node will be TAGGED (%s): owned by the tailnet, key expiry disabled.\n' "$CFG_TAGS"
+  else
+    printf '\nThis node will be USER-OWNED: its key expires in 180 days and needs a browser to renew.\n'
+  fi
+}
+
+cmd_status() {
+  need_daemon
+  "$TAILSCALE_BIN" status "$@"
+}
+
+cmd_info() {
+  printf 'config:      %s%s\n' "$TSM_CONFIG" "$([[ -f "$TSM_CONFIG" ]] || printf ' (missing)')"
+  printf 'cache:       %s\n' "$TSM_CACHE"
+  printf 'tailscale:   %s\n' "${TAILSCALE_BIN:-not found}"
+  if [[ -n "${TAILSCALE_BIN:-}" ]]; then
+    printf 'version:     %s\n' "$("$TAILSCALE_BIN" version 2>/dev/null | head -1)"
+    printf 'daemon:      %s\n' "$(daemon_ready && echo 'responding' || echo 'not responding')"
+    printf 'key handoff: %s%s\n' "$(authkey_mode)" \
+      "$([[ -n "${TSM_AUTHKEY_MODE:-}" ]] && printf ' (forced by TSM_AUTHKEY_MODE)' || printf ' (probed)')"
+  fi
+  if command -v fnox >/dev/null 2>&1; then
+    printf 'fnox:        %s' "$(fnox version 2>/dev/null | head -1 || echo installed)"
+    uses_fnox && printf ' (config in %s)' "$TSM_FNOX_DIR"
+    printf '\n'
+  else
+    printf 'fnox:        not installed (export TS_AUTHKEY by hand)\n'
+  fi
+  if [[ -f "$TSM_CONFIG" ]] && load_config 2>/dev/null; then
+    if ack_is_current; then
+      printf 'prereq ack:  %s\n' "$(awk -F= '$1=="acknowledged_at"{print $2}' "$(ack_file)" 2>/dev/null)"
+    else
+      printf 'prereq ack:  none for this config (tsm join will ask)\n'
+    fi
+  fi
+}
+
+# Already joined? `tailscale status --json` reports BackendState: Running, Stopped,
+# NeedsLogin, NoState. Anything other than NeedsLogin/NoState means we have an identity.
+backend_state() {
+  "$TAILSCALE_BIN" status --json 2>/dev/null | yq -p json -r '.BackendState // "Unknown"' 2>/dev/null || printf 'Unknown\n'
+}
+
+is_logged_in() {
+  case "$(backend_state)" in
+    Running|Stopped|Starting) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+need_daemon() {
+  daemon_ready && return 0
+  die "the tailscale daemon is not responding\n  %s" "$(daemon_hint)"
+}
+
+cmd_join() {
+  load_config
+  check_unknown_keys
+  need_daemon
+
+  # Already on the tailnet: reconcile rather than re-authenticate. This is what makes
+  # re-running `ppm install` a no-op instead of a fresh login.
+  if is_logged_in; then
+    printf 'tsm: already joined (%s); reconciling settings instead of re-authenticating\n' "$(backend_state)"
+    cmd_set
+    return
+  fi
+
+  preflight_ssh_guard
+  require_prereq_ack
+
+  local key kind
+  key="$(resolve_authkey)"
+  kind="$(classify_authkey "$key")"
+
+  [[ "$kind" != "unknown" ]] || die "TS_AUTHKEY is not a Tailscale key (expected tskey-client-... or tskey-auth-...)"
+  if [[ "$kind" == "oauth" && -z "$CFG_TAGS" ]]; then
+    die "TS_AUTHKEY is an OAuth client secret, which can only create a tagged node,\n  but no tags are set in %s\n  add a tag (and declare it in tagOwners), or use a plain auth key" "$TSM_CONFIG"
+  fi
+  [[ "$kind" != "authkey" ]] || warn "TS_AUTHKEY is a plain auth key — Tailscale caps these at 90 days.\n     An OAuth client secret does not expire; see tsm prereqs."
+
+  build_join_flags
+  run_up "$key"
+}
+
+# Keep the secret out of argv where the CLI allows it. See authkey_mode().
+run_up() {
+  local key="$1" mode
+  mode="$(authkey_mode)"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    printf 'would run: tailscale up --auth-key=<TS_AUTHKEY:%s> %s\n' "$mode" "${TS_FLAGS[*]:-}"
+    return 0
+  fi
+
+  # sudo closes every fd >= 3 before exec, so the pipe handoff cannot survive it. When
+  # this platform needs sudo there is nothing to gain by trying.
+  if [[ "$mode" == "file" ]] && ts_needs_sudo; then
+    mode=argv
+    warn "passing the key directly: sudo closes the fd the file: form would use"
+  fi
+
+  if [[ "$mode" == "file" ]]; then
+    # An anonymous pipe, not a file: the key is never written to any filesystem and the
+    # fd dies with the process, so it reaches neither argv nor disk.
+    if ts_privileged up --auth-key=file:/dev/fd/3 ${TS_FLAGS[@]+"${TS_FLAGS[@]}"} 3< <(printf '%s' "$key"); then
+      return 0
+    fi
+    warn "the CLI did not accept --auth-key=file:; falling back to passing it directly"
+  fi
+
+  ts_privileged up --auth-key="$key" ${TS_FLAGS[@]+"${TS_FLAGS[@]}"}
+}
+
+resolve_authkey() {
+  local key
+  key="$(try_authkey || true)"
+  [[ -n "$key" ]] || die "TS_AUTHKEY is not set and fnox could not resolve it%s\n  check:  fnox config-files && fnox list\n  see:    tsm prereqs" \
+    "$(uses_fnox && printf ' (a fnox.toml is in %s)' "$TSM_FNOX_DIR" || true)"
+  printf '%s' "$key"
+}
+
+# Reconcile an already-joined node. `tailscale set` changes preferences in place with no
+# re-auth and covers every config key except tags, which is join-time only.
+cmd_set() {
+  load_config
+  check_unknown_keys
+  need_daemon
+  preflight_ssh_guard
+  build_flags
+
+  if [[ ${#TS_FLAGS[@]} -eq 0 ]]; then
+    printf 'tsm: nothing to set — the config declares no reconcilable keys\n'
+    return 0
+  fi
+
+  if [[ -n "$CFG_TAGS" ]] && ! is_logged_in; then
+    warn 'tags (%s) are applied at join time only; tsm set cannot change them' "$CFG_TAGS"
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    printf 'would run: tailscale set %s\n' "${TS_FLAGS[*]:-}"
+    return 0
+  fi
+  ts_privileged set ${TS_FLAGS[@]+"${TS_FLAGS[@]}"}
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd="" rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--dry-run) DRY_RUN=true ;;
+      -y|--yes)     ASSUME_YES=true ;;
+      -h|--help)    usage; exit 0 ;;
+      --)           shift; while [[ $# -gt 0 ]]; do rest[${#rest[@]}]="$1"; shift; done; break ;;
+      -*)           die "unknown option: %s (try: tsm help)" "$1" ;;
+      *)            if [[ -z "$cmd" ]]; then cmd="$1"; else rest[${#rest[@]}]="$1"; fi ;;
+    esac
+    shift || true
+  done
+
+  load_libs
+  TAILSCALE_BIN="$(find_tailscale_bin || true)"
+
+  case "${cmd:-help}" in
+    join)    enter_fnox; cmd_join ;;
+    set)     enter_fnox; cmd_set ;;
+    show)    cmd_show ;;
+    status)  cmd_status ${rest[@]+"${rest[@]}"} ;;
+    prereqs) enter_fnox; cmd_prereqs ;;
+    info)    enter_fnox; cmd_info ;;
+    help)    usage ;;
+    *)       die "unknown command: %s (try: tsm help)" "$cmd" ;;
+  esac
+}
+
+main "$@"

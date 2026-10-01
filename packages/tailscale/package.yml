@@ -1,4 +1,18 @@
-version: 0.1.0
+version: 0.1.1
 author: rjayroach
+
+# macOS: the cask is the GUI app. It has no `binary` stanza, so nothing lands on PATH —
+# the CLI is inside the bundle at /Applications/Tailscale.app/Contents/MacOS/Tailscale.
+# tsm resolves it by absolute path; see home/.config/zsh/tailscale.zsh for the shim that
+# makes `tailscale` and its completions work in an interactive shell.
+#
+# Linux: no declaration. tailscaled comes from the vendor installer in install.sh, which
+# adds Tailscale's apt/dnf repo and signing key and sets up the systemd unit — none of
+# which ppm's brew/cask/system vocabulary can express.
 cask:
   macos: [tailscale-app]
+
+depends:
+  # tsm resolves the join credential with `fnox get`; without it the join is manual.
+  # fnox lives in pde, a lower-priority repo than utils, so this edge is legal.
+  - fnox
