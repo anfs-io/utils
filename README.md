@@ -1,6 +1,6 @@
 # utils-ppm
 
-Utility packages for [ppm](https://github.com/maxcole/ppm), covering the things that are
+Utility packages for [ppm](https://github.com/anfs-io/system), covering the things that are
 neither a development environment nor a language toolchain: networking, storage, and the
 tools for putting an operating system onto hardware.
 
@@ -34,7 +34,7 @@ software, `install.sh` holds anything imperative, and `home/` is the stow tree.
 ## Conventions
 
 These follow the repo-wide ppm conventions — see
-[ppm's CLAUDE.md](https://github.com/maxcole/ppm/blob/main/CLAUDE.md) for the full spec.
+[ppm's CLAUDE.md](https://github.com/anfs-io/system/blob/main/CLAUDE.md) for the full spec.
 Two worth knowing when reading these packages:
 
 - **Software is declared, not installed.** `package.yml` lists `brew` / `cask` / `system`
